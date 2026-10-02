@@ -1,6 +1,7 @@
 //! Pull request follow-up. Everything read from GitHub is attacker-chosen
 //! text: only a fixed set of fields is kept, names are sanitised, and comment
-//! bodies are never copied anywhere.
+//! bodies are never copied anywhere. Azure DevOps pull requests (`ado.rs`)
+//! are dispatched to by URL or `origin` and reduce to the same `Summary`.
 
 use std::time::Duration;
 
@@ -13,8 +14,9 @@ pub const GH_TIMEOUT: Duration = Duration::from_secs(10);
 const NAME_LIMIT: usize = 80;
 
 /// The `PR:` value of a report's first line, only when it is exactly
-/// `https://github.com/<owner>/<repo>/pull/<number>`. `Err` carries a note for
-/// the inbox item when a `PR:` line is present but not acceptable.
+/// `https://github.com/<owner>/<repo>/pull/<number>` or an Azure DevOps pull
+/// request URL (`ado::parse_pr_url`). `Err` carries a note for the inbox item
+/// when a `PR:` line is present but not acceptable.
 pub fn pr_line(report: &str) -> Result<Option<String>, String> {
     let Some(first) = report.lines().next() else {
         return Ok(None);
@@ -26,11 +28,26 @@ pub fn pr_line(report: &str) -> Result<Option<String>, String> {
     if valid_pr_url(value) {
         Ok(Some(value.to_string()))
     } else {
-        Err("the report's `PR:` line is not a https://github.com/<owner>/<repo>/pull/<number> URL and was ignored".into())
+        Err("the report's `PR:` line is not a https://github.com/<owner>/<repo>/pull/<number> or https://dev.azure.com/<org>/<project>/_git/<repo>/pullrequest/<number> URL and was ignored".into())
     }
 }
 
 pub fn valid_pr_url(url: &str) -> bool {
+    github_pr_url(url) || crate::ado::parse_pr_url(url).is_some()
+}
+
+/// Whether a pull request URL or a remote URL is on Azure DevOps.
+pub fn is_ado(url_or_origin: &str) -> bool {
+    crate::ado::parse_pr_url(url_or_origin).is_some() || crate::ado::parse_remote(url_or_origin).is_some()
+}
+
+/// The command a pull request URL or a remote is followed with: `az` for
+/// Azure DevOps, `gh` otherwise.
+pub fn tool_of(url_or_origin: &str) -> &'static str {
+    if is_ado(url_or_origin) { "az" } else { "gh" }
+}
+
+fn github_pr_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://github.com/") else {
         return false;
     };
@@ -181,6 +198,9 @@ struct GhOwner {
 /// repository, not the URL, keeps fork workflows working: there `origin` is the
 /// fork and the pull request URL is upstream.
 pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
+    if crate::ado::is_view(json) {
+        return crate::ado::reduce(json, branch, origin);
+    }
     let view: GhView = serde_json::from_str(json)?;
     if branch.is_empty() {
         return Ok(Checked::Ignored("the thread has no branch".into()));
@@ -239,8 +259,12 @@ pub fn reduce(json: &str, branch: &str, origin: &str) -> Result<Checked> {
 }
 
 /// The login `gh` acts as on `origin`'s host: comments by it are the threads'
-/// own replies.
+/// own replies. `None` for an Azure DevOps `origin`, whose reduce leaves the
+/// pull request creator's own activity out instead.
 pub fn own_login(runner: &dyn Runner, origin: &str) -> Option<String> {
+    if is_ado(origin) {
+        return None;
+    }
     let out = runner.run(&gh(&host_of(origin)).args(["api", "user", "--jq", ".login"])).ok()?;
     out.success().then(|| sanitize(out.stdout.trim())).filter(|l| !l.is_empty())
 }
@@ -249,7 +273,10 @@ pub fn own_login(runner: &dyn Runner, origin: &str) -> Option<String> {
 /// sends a URL to the URL's own host, so off `github.com` the pull request
 /// goes by number and `--repo` instead.
 pub fn view(runner: &dyn Runner, url: &str, origin: &str) -> Result<String> {
-    if !valid_pr_url(url) {
+    if let Some(pr) = crate::ado::parse_pr_url(url) {
+        return crate::ado::view(runner, &pr);
+    }
+    if !github_pr_url(url) {
         bail!("not a pull request URL");
     }
     const FIELDS: &str = "state,reviewDecision,statusCheckRollup,comments,reviews,headRefName,headRefOid,headRepository,headRepositoryOwner";
@@ -283,6 +310,9 @@ struct GhListed {
 /// without asking when `origin` is not on GitHub. A fork's pull request lives
 /// upstream and is found only through the report's `PR:` line.
 pub fn find_by_branch(runner: &dyn Runner, origin: &str, branch: &str) -> Result<Option<String>> {
+    if let Some(repo) = crate::ado::parse_remote(origin) {
+        return crate::ado::find_by_branch(runner, &repo, branch);
+    }
     let Some(Remote { host, repo }) = parse_remote(origin) else {
         return Ok(None);
     };
@@ -306,7 +336,7 @@ pub fn find_by_branch(runner: &dyn Runner, origin: &str, branch: &str) -> Result
         bail!("gh pr list: {}", out.error_text());
     }
     let mut listed: Vec<GhListed> = serde_json::from_str(&out.stdout)?;
-    listed.retain(|p| valid_pr_url(&p.url));
+    listed.retain(|p| github_pr_url(&p.url));
     let rank = |state: &str| match state.to_ascii_uppercase().as_str() {
         "OPEN" => 0,
         "MERGED" => 1,
@@ -334,16 +364,21 @@ pub fn describe_change(old: Option<&Summary>, new: &Summary) -> String {
     parts.join("; ")
 }
 
-/// Pull requests a report names, per `owner/repo`: full pull request URLs,
-/// and `#N` for the `origin` repository. `except` (the thread's tracked pull
-/// request) is left out. Issue numbers come along too; the caller only counts
-/// numbers GitHub lists as open pull requests.
+/// Pull requests a report names, per repository key (`owner/repo` on
+/// GitHub, `ado::Repo::key` on Azure DevOps): full pull request URLs, and for
+/// the `origin` repository `#N` on GitHub or `!N` on Azure DevOps (where `#N`
+/// is a work item). `except` (the thread's tracked pull request) is left out.
+/// Issue numbers come along too; the caller only counts numbers listed as
+/// open pull requests.
 pub fn report_refs(report: &str, origin: &str, except: &str) -> std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> {
     let mut refs: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> = Default::default();
-    let own = normalize_origin(origin);
+    let (own, mark) = match crate::ado::parse_remote(origin) {
+        Some(repo) => (Some(repo.key()), '!'),
+        None => (normalize_origin(origin), '#'),
+    };
     let chars: Vec<char> = report.chars().collect();
     for (i, c) in chars.iter().enumerate() {
-        if *c == '#' {
+        if *c == mark {
             let before = i.checked_sub(1).map(|j| chars[j]);
             if before.is_some_and(|b| b.is_alphanumeric() || matches!(b, '/' | '-' | '_' | '.' | '&')) {
                 continue; // `repo#12`, an anchor, an entity
@@ -355,29 +390,38 @@ pub fn report_refs(report: &str, origin: &str, except: &str) -> std::collections
         }
     }
     for word in report.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>' | '[' | ']' | '`' | ',' | ';' | '"')) {
-        let url = word.trim_end_matches(['.', ':', '!', '?']);
-        if !valid_pr_url(url) {
-            continue;
-        }
-        let parts: Vec<&str> = url.trim_start_matches("https://github.com/").split('/').collect();
-        if let Ok(n) = parts[3].parse::<u32>() {
-            refs.entry(format!("{}/{}", parts[0], parts[1]).to_lowercase()).or_default().insert(n);
+        if let Some((repo, n)) = pr_number(word.trim_end_matches(['.', ':', '!', '?'])) {
+            refs.entry(repo).or_default().insert(n);
         }
     }
-    if valid_pr_url(except) {
-        let parts: Vec<&str> = except.trim_start_matches("https://github.com/").split('/').collect();
-        let repo = format!("{}/{}", parts[0], parts[1]).to_lowercase();
-        if let (Some(set), Ok(n)) = (refs.get_mut(&repo), parts[3].parse::<u32>()) {
-            set.remove(&n);
-        }
+    if let Some((repo, n)) = pr_number(except)
+        && let Some(set) = refs.get_mut(&repo)
+    {
+        set.remove(&n);
     }
     refs.retain(|_, set| !set.is_empty());
     refs
 }
 
-/// Numbers of the open pull requests in `repo` (`owner/repo`) that the `gh`
-/// user opened, asked through `host`. One `gh` call.
+/// The repository key and number of a pull request URL.
+fn pr_number(url: &str) -> Option<(String, u32)> {
+    if let Some(pr) = crate::ado::parse_pr_url(url) {
+        return Some((pr.repo.key(), pr.id));
+    }
+    if !github_pr_url(url) {
+        return None;
+    }
+    let parts: Vec<&str> = url.trim_start_matches("https://github.com/").split('/').collect();
+    Some((format!("{}/{}", parts[0], parts[1]).to_lowercase(), parts[3].parse().ok()?))
+}
+
+/// Numbers of the open pull requests in `repo` (a `report_refs` key) that
+/// the `gh` user opened, asked through `host`; on Azure DevOps the `az`
+/// account's. One call.
 pub fn open_own_numbers(runner: &dyn Runner, repo: &str, host: &str) -> Result<std::collections::BTreeSet<u32>> {
+    if let Some(repo) = crate::ado::from_key(repo) {
+        return crate::ado::open_own_numbers(runner, &repo);
+    }
     #[derive(Deserialize)]
     struct Listed {
         number: u32,
@@ -403,6 +447,38 @@ mod tests {
         assert_eq!(refs.get("o/ws").unwrap().iter().copied().collect::<Vec<_>>(), [38]);
         assert_eq!(refs.len(), 2, "`other#29` names another repository by a short name and is skipped");
         assert!(report_refs("PR: https://github.com/o/app/pull/1\n## Report\ndone, #1 merged\n", "https://github.com/o/app", "https://github.com/o/app/pull/1").is_empty());
+    }
+
+    #[test]
+    fn an_azure_devops_pr_line_is_accepted_and_its_refs_are_bang_numbers() {
+        let url = "https://dev.azure.com/Contoso/Tools/_git/app/pullrequest/5589";
+        assert_eq!(pr_line(&format!("PR: {url}\n## Report\n")).unwrap().as_deref(), Some(url));
+        assert!(pr_line("PR: https://dev.azure.com/Contoso/Tools/_git/app/pullrequest/5589?_a=files").is_err());
+        assert!(pr_line("PR: https://dev.azure.com/o/p/_git/r").unwrap_err().contains("dev.azure.com"));
+        assert_eq!((tool_of(url), tool_of("git@ssh.dev.azure.com:v3/o/p/r"), tool_of("https://github.com/o/r/pull/1"), tool_of("")), ("az", "az", "gh", "gh"));
+
+        let origin = "git@ssh.dev.azure.com:v3/Contoso/Tools/app";
+        let report = format!("PR: {url}\n## Report\n!5589 merged; !5590 waits, work item #7731 (not a PR).\nAlso https://dev.azure.com/Contoso/Wiki/_git/docs/pullrequest/12 and https://github.com/o/ws/pull/38.\n");
+        let refs = report_refs(&report, origin, url);
+        assert_eq!(refs.get("dev.azure.com/contoso/tools/app").unwrap().iter().copied().collect::<Vec<_>>(), [5590]);
+        assert_eq!(refs.get("dev.azure.com/contoso/wiki/docs").unwrap().iter().copied().collect::<Vec<_>>(), [12]);
+        assert_eq!(refs.get("o/ws").unwrap().iter().copied().collect::<Vec<_>>(), [38]);
+        assert_eq!(refs.len(), 3);
+        // On GitHub `!N` means nothing.
+        assert!(report_refs("## Report\n!5 and done!\n", "git@github.com:o/r.git", "").is_empty());
+    }
+
+    #[test]
+    fn an_azure_devops_origin_never_asks_gh() {
+        use crate::runner::fake::{FakeRunner, ok};
+        let runner = FakeRunner::new();
+        runner.on("az repos pr list", ok("[]"));
+        runner.on("az account show", ok("me@example.com"));
+        let origin = "https://dev.azure.com/Contoso/Tools/_git/app";
+        assert_eq!(own_login(&runner, origin), None);
+        assert_eq!(find_by_branch(&runner, origin, "b").unwrap(), None);
+        assert!(open_own_numbers(&runner, "dev.azure.com/contoso/tools/app", &host_of(origin)).unwrap().is_empty());
+        assert!(runner.calls.borrow().iter().all(|c| c.program == "az"), "{:?}", runner.calls.borrow().iter().map(|c| c.display()).collect::<Vec<_>>());
     }
 
     #[test]

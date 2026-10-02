@@ -62,7 +62,7 @@ pub fn save_state(project: &Project, state: &State) -> Result<()> {
     project::write_json(&project.state_dir().join("ticker.json"), state)
 }
 
-/// Continuous-failure tracking for `gh` or a machine: one item when it has
+/// Continuous-failure tracking for `gh`, `az` or a machine: one item when it has
 /// failed for the threshold, one more when it recovers, nothing for blips.
 #[derive(Debug, Clone, Default)]
 pub struct Outage {
@@ -110,6 +110,7 @@ pub struct MachineMemory {
 pub struct Memory {
     pub started: jiff::Timestamp,
     pub gh: Outage,
+    pub az: Outage,
     /// The login `gh` acts as, asked once (`None` until known).
     pub gh_login: Option<String>,
     pub outage_secs: i64,
@@ -124,6 +125,7 @@ impl Memory {
         Memory {
             started: jiff::Timestamp::now(),
             gh: Outage::default(),
+            az: Outage::default(),
             gh_login: None,
             // Overridable so an outage can be exercised without waiting ten minutes.
             outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
@@ -287,7 +289,7 @@ pub fn nudge_text(items: &[inbox::Item]) -> String {
         let subject = inbox::safe_subject(&item.subject);
         let who = match item.kind.as_str() {
             "routine" | "routine-approval" => format!("routine {subject}"),
-            "outage" if subject != "gh" => format!("machine {subject}"),
+            "outage" if !matches!(subject.as_str(), "gh" | "az") => format!("machine {subject}"),
             "session" | "space" => String::new(),
             _ => subject,
         };
@@ -393,15 +395,20 @@ pub fn pr_events(old: Option<&pr::Summary>, new: &pr::Summary, own_login: Option
 }
 
 /// The prompt a `pr` routine sends a thread: the routine's text plus facts
-/// this binary generated. Nothing written on GitHub (check names, comment
-/// text, logins) is placed in a prompt; the thread reads it with `gh`.
+/// this binary generated. Nothing written on GitHub or Azure DevOps (check
+/// names, comment text, logins) is placed in a prompt; the thread reads it
+/// with `gh` or `az`.
 pub fn pr_routine_prompt(name: &str, body: &str, url: &str, events: &[&str], summary: &pr::Summary) -> String {
+    let (checks, comments) = match crate::ado::parse_pr_url(url) {
+        Some(pr) => (pr.checks_command(), format!("{}`, comments: `{}", pr.show_command(), pr.threads_command())),
+        None => (format!("gh pr checks {url}"), format!("gh pr view {url} --comments")),
+    };
     let mut facts = Vec::new();
     if events.contains(&"checks-failed") {
-        facts.push(format!("{} check(s) fail (`gh pr checks {url}`)", summary.failing_checks.len()));
+        facts.push(format!("{} check(s) fail (`{checks}`)", summary.failing_checks.len()));
     }
     if events.contains(&"review") {
-        facts.push(format!("{} comment(s), review {} (`gh pr view {url} --comments`)", summary.comment_count, if summary.review_decision.is_empty() { "none".to_string() } else { summary.review_decision.to_lowercase() }));
+        facts.push(format!("{} comment(s), review {} (`{comments}`)", summary.comment_count, if summary.review_decision.is_empty() { "none".to_string() } else { summary.review_decision.to_lowercase() }));
     }
     if events.contains(&"opened") {
         facts.push("it was opened".into());
@@ -442,13 +449,14 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
         } else if !t.pr.is_empty() {
             t.pr.clone()
         } else if t.kind == thread::Kind::Worktree {
+            let tool = pr::tool_of(&t.origin);
             match pr::find_by_branch(ctx.runner, &t.origin, &t.branch) {
                 Ok(found) => {
-                    gh_worked(project, memory, now, &mut errors);
+                    tool_worked(project, memory, tool, now, &mut errors);
                     found.unwrap_or_default()
                 }
                 Err(error) => {
-                    gh_failed(project, &notifier, memory, &error, now, &mut errors);
+                    tool_failed(project, &notifier, memory, tool, &error, now, &mut errors);
                     continue;
                 }
             }
@@ -463,18 +471,19 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
             continue;
         }
 
+        let tool = pr::tool_of(&url);
         let json = match pr::view(ctx.runner, &url, &t.origin) {
             Ok(json) => {
-                gh_worked(project, memory, now, &mut errors);
+                tool_worked(project, memory, tool, now, &mut errors);
                 json
             }
             Err(error) => {
-                gh_failed(project, &notifier, memory, &error, now, &mut errors);
+                tool_failed(project, &notifier, memory, tool, &error, now, &mut errors);
                 continue;
             }
         };
         match pr::reduce(&json, &t.branch, &t.origin) {
-            Err(error) => errors.push(error.context(format!("{}: gh output", t.id))),
+            Err(error) => errors.push(error.context(format!("{}: {tool} output", t.id))),
             Ok(pr::Checked::Ignored(reason)) => {
                 if state.pr_ignored.get(&t.id) != Some(&url) {
                     state.pr_ignored.insert(t.id.clone(), url.clone());
@@ -493,10 +502,16 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
                 }).err());
                 let change = pr::describe_change(old.as_ref(), &summary);
                 let merged = summary.state == "MERGED";
-                if memory.gh_login.is_none() {
-                    memory.gh_login = pr::own_login(ctx.runner, &t.origin);
-                }
-                let events = pr_events(old.as_ref(), &summary, memory.gh_login.as_deref());
+                // On Azure DevOps `reduce` already left the thread's own activity out.
+                let own_login = if tool == "az" {
+                    None
+                } else {
+                    if memory.gh_login.is_none() {
+                        memory.gh_login = pr::own_login(ctx.runner, &t.origin);
+                    }
+                    memory.gh_login.as_deref()
+                };
+                let events = pr_events(old.as_ref(), &summary, own_login);
                 errors.extend(inbox::write(project, "pr", &t.id, pr_event(&events, &summary), &format!("{}: pull request {change}", thread_label(&t)), "").err());
                 let number = url.rsplit('/').next().unwrap_or("");
                 if merged {
@@ -514,18 +529,25 @@ pub fn pull_requests(ctx: &Ctx, project: &Project, state: &mut State, memory: &m
     errors
 }
 
-fn gh_worked(project: &Project, memory: &mut Memory, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
-    if memory.gh.record(true, "", now, memory.outage_secs) == Some(OutageEvent::Recovered) {
-        errors.extend(inbox::write(project, "outage", "gh", "working again", "`gh` is working again; pull request follow-up has resumed", "").err());
+/// `tool` is `gh` or `az` (`pr::tool_of`); each has its own outage.
+fn tool_outage<'a>(memory: &'a mut Memory, tool: &str) -> &'a mut Outage {
+    if tool == "az" { &mut memory.az } else { &mut memory.gh }
+}
+
+fn tool_worked(project: &Project, memory: &mut Memory, tool: &str, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
+    let threshold = memory.outage_secs;
+    if tool_outage(memory, tool).record(true, "", now, threshold) == Some(OutageEvent::Recovered) {
+        errors.extend(inbox::write(project, "outage", tool, "working again", &format!("`{tool}` is working again; pull request follow-up has resumed"), "").err());
     }
 }
 
-fn gh_failed(project: &Project, notifier: &crate::notify::Notifier, memory: &mut Memory, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
+fn tool_failed(project: &Project, notifier: &crate::notify::Notifier, memory: &mut Memory, tool: &str, error: &anyhow::Error, now: jiff::Timestamp, errors: &mut Vec<anyhow::Error>) {
     let text = pr::sanitize(&format!("{error:#}"));
-    if memory.gh.record(false, &text, now, memory.outage_secs) == Some(OutageEvent::Down) {
-        let summary = format!("`gh` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", memory.outage_secs / 60);
-        errors.extend(inbox::write(project, "outage", "gh", "failing", &summary, "").err());
-        notifier.send("gh", "pull requests are not being followed: `gh` keeps failing", crate::notify::Sound::None, true);
+    let threshold = memory.outage_secs;
+    if tool_outage(memory, tool).record(false, &text, now, threshold) == Some(OutageEvent::Down) {
+        let summary = format!("`{tool}` has been failing for {} minutes; pull requests are not being followed. Last error: {text}", threshold / 60);
+        errors.extend(inbox::write(project, "outage", tool, "failing", &summary, "").err());
+        notifier.send(tool, &format!("pull requests are not being followed: `{tool}` keeps failing"), crate::notify::Sound::None, true);
     }
 }
 
@@ -773,6 +795,7 @@ mod tests {
         assert!(!text.contains("IGNORE"));
         // Items written before events existed fall back to their kind.
         assert_eq!(nudge_text(&[item("config-error", "PROJECT.md", "")]), "[hp inbox] project-md config error");
+        assert_eq!(nudge_text(&[item("outage", "az", "failing")]), "[hp inbox] az failing");
     }
 
     #[test]
@@ -796,6 +819,13 @@ mod tests {
         let prompt = pr_routine_prompt("pr-followup", "Fix it.", "https://github.com/o/r/pull/4", &["checks-failed"], &failing);
         assert_eq!(prompt, "[hp routine pr-followup] Your pull request https://github.com/o/r/pull/4 changed: 1 check(s) fail (`gh pr checks https://github.com/o/r/pull/4`).\n\nFix it.");
         assert!(!prompt.contains("lint"), "check names are GitHub text and never reach a prompt");
+        let ado = "https://dev.azure.com/o/p/_git/r/pullrequest/4";
+        let prompt = pr_routine_prompt("pr-followup", "Fix it.", ado, &["checks-failed", "review"], &failing);
+        assert_eq!(
+            prompt,
+            "[hp routine pr-followup] Your pull request https://dev.azure.com/o/p/_git/r/pullrequest/4 changed: 1 check(s) fail (`az repos pr policy list --id 4 --org https://dev.azure.com/o`); \
+             0 comment(s), review none (`az repos pr show --id 4 --org https://dev.azure.com/o`, comments: `az devops invoke --area git --resource pullRequestThreads --route-parameters project=p repositoryId=r pullRequestId=4 --api-version 7.1 --org https://dev.azure.com/o`).\n\nFix it."
+        );
     }
 
     #[test]

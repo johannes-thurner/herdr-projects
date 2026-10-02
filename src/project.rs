@@ -577,7 +577,7 @@ pub fn prefix_in_agents_md(text: &str) -> Option<String> {
 
 pub const PR_FOLLOWUP: &str = "routines/pr-followup.md";
 
-const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh`, push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n";
+const PR_FOLLOWUP_TEMPLATE: &str = "+++\non = \"pr\"\nevents = [\"checks-failed\", \"review\"]\nenabled = true\n+++\n\nFix the failing checks and address the new review comments on your pull request. Read them with `gh` (GitHub) or `az repos` (Azure DevOps), push the fixes, reply where a reviewer asked something, and then rewrite your report. If a comment asks for something outside your task, say so in the report instead of doing it.\n";
 
 /// The ready-made `pr` routine (enabled by default; the popup or the
 /// coordinator turns it off). Written by `new` and by `doctor --fix` when
