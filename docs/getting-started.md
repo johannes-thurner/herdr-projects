@@ -8,7 +8,7 @@ Install the plugin, run `configure` once, create a project, and talk to its coor
 - Only to build from source: Rust/Cargo 1.89 or newer and a C compiler. Releases carry prebuilt binaries for macOS and Linux on Apple Silicon/arm64 and Intel/x86_64, so most installs need neither. On macOS, `xcode-select --install` installs Apple's build tools. Install Rust with [rustup](https://rustup.rs).
 - Git.
 - An agent CLI Herdr can start, on `PATH`. Any of Herdr's 24 agent kinds works (`claude`, `codex`, `opencode`, `cursor`, `gemini` and more). Claude Code is the one exercised most. Every agent that can run a shell command reports its own progress: thread briefs and the coordinator skill carry the instructions. `configure` also installs hooks for Claude Code, Codex, Droid, Gemini CLI and Copilot CLI, which add a reminder about once a minute.
-- Optional: `gh`, logged in, for pull request follow-up; `ssh` and `rsync` for threads on other machines.
+- Optional: `gh`, logged in, for pull request follow-up on GitHub; for Azure DevOps, `az` with the `azure-devops` extension (`az extension add --name azure-devops`), logged in with `az login`; `ssh` and `rsync` for threads on other machines.
 
 The plugin needs no hosted service and no API key. It depends on Herdr and nothing else, no other plugin included.
 

@@ -15,7 +15,7 @@ When you finish, and whenever you stop to wait for the user, write your report t
 
 The report format:
 
-- An optional first line `PR: <url>` when you opened a pull request, with the full `https://github.com/<owner>/<repo>/pull/<number>` URL.
+- An optional first line `PR: <url>` when you opened a pull request, with the full `https://github.com/<owner>/<repo>/pull/<number>` URL, or on Azure DevOps `https://dev.azure.com/<org>/<project>/_git/<repo>/pullrequest/<number>`.
 - A `## Report` section: what you did, what you found, what is left, and anything the user must decide.
 - A `## Next` section, required: one recommended action per line, imperative, at most 100 characters (`Merge the PR`, `Fix the failing lint check`, `Confirm that X is wanted`, `Remove the worktree and branch`). The user presses a key to send a line back to you, and you then do it yourself with your own tools. Include the cleanup you propose once the work has landed. An empty list means there is nothing to do.
 - An optional `## Remember` section: short, durable lessons for future threads.
