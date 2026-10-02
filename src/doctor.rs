@@ -13,25 +13,33 @@ use crate::runner::{Cmd, Runner};
 
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// GitHub hosts of the `origin` remotes of this directory's repository and
-/// of each project's local repositories, with one `owner/repo` on each.
-fn github_hosts(root: &Path, runner: &dyn Runner) -> std::collections::BTreeMap<String, String> {
+/// Pull request hosts of the `origin` remotes of this directory's repository
+/// and of each project's local repositories: GitHub hosts with one
+/// `owner/repo` on each, and Azure DevOps organizations with one repository.
+type Remotes = (std::collections::BTreeMap<String, String>, std::collections::BTreeMap<String, crate::ado::Repo>);
+
+fn pr_remotes(root: &Path, runner: &dyn Runner) -> Remotes {
     let mut dirs: Vec<String> = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).into_iter().collect();
     for slug in project::list_slugs(root) {
         if let Ok((settings, _)) = project::Project::load(root, &slug).and_then(|p| p.read_project_md()) {
             dirs.extend(settings.repos.into_iter().filter(|r| r.machine.is_none()).map(|r| r.path));
         }
     }
-    let mut hosts = std::collections::BTreeMap::new();
+    let (mut hosts, mut azure) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
     for dir in dirs {
         let Ok(out) = runner.run(&Cmd::new("git", TOOL_TIMEOUT).args(["-C", &dir, "remote", "get-url", "origin"])) else {
             continue;
         };
-        if let Some(remote) = out.success().then(|| crate::pr::parse_remote(&out.stdout)).flatten() {
+        if !out.success() {
+            continue;
+        }
+        if let Some(remote) = crate::pr::parse_remote(&out.stdout) {
             hosts.entry(remote.host).or_insert(remote.repo);
+        } else if let Some(repo) = crate::ado::parse_remote(&out.stdout) {
+            azure.entry(repo.org.to_lowercase()).or_insert(repo);
         }
     }
-    hosts
+    (hosts, azure)
 }
 
 /// Prints the report and returns whether every required check passed. With
@@ -148,7 +156,7 @@ fn report(
     // `gh` per GitHub host the repositories use: the one in this directory
     // and each project's local ones. Off `github.com` the check runs as the
     // pull request follow-up does, with `GH_HOST` set.
-    let hosts = github_hosts(root, runner);
+    let (hosts, azure) = pr_remotes(root, runner);
     if hosts.is_empty() || hosts.contains_key("github.com") {
         match runner.run(&Cmd::new("gh", TOOL_TIMEOUT).args(["auth", "status"])) {
             Ok(o) if o.success() => check(&mut out, Some(true), "gh auth", "logged in".into()),
@@ -179,6 +187,49 @@ fn report(
                 ),
             ),
             Err(error) => check(&mut out, None, &label, format!("gh cannot reach {host} ({error:#}); pull requests of {repo} are not followed")),
+        }
+    }
+    // `az` only when a repository is on Azure DevOps: `az` with the
+    // `azure-devops` extension, then each organization as the pull request
+    // follow-up reaches it. All warnings, as for `gh`.
+    if !azure.is_empty() {
+        let installed = match runner.run(&Cmd::new("az", crate::ado::AZ_TIMEOUT).args(["version", "-o", "json"])) {
+            Ok(o) if o.success() => {
+                let version: serde_json::Value = serde_json::from_str(&o.stdout).unwrap_or_default();
+                let text = |v: &serde_json::Value| v.as_str().map(crate::pr::sanitize).unwrap_or_default();
+                check(&mut out, Some(true), "az", format!("azure-cli {}", text(&version["azure-cli"])));
+                match version["extensions"].get("azure-devops") {
+                    Some(ext) => check(&mut out, Some(true), "az devops", format!("azure-devops extension {}", text(ext))),
+                    None => check(&mut out, None, "az devops", "the azure-devops extension is missing; Azure DevOps pull requests are not followed. Run `az extension add --name azure-devops`".into()),
+                }
+                true
+            }
+            Ok(o) => {
+                check(&mut out, None, "az", format!("{}; Azure DevOps pull requests are not followed", o.error_text().lines().next().unwrap_or("failed")));
+                false
+            }
+            Err(_) => {
+                check(&mut out, None, "az", "az is not installed; Azure DevOps pull requests are not followed".into());
+                false
+            }
+        };
+        for repo in azure.values().filter(|_| installed) {
+            let label = format!("azure devops {}", repo.org);
+            let name = format!("{}/{}/{}", repo.org, repo.project, repo.name);
+            match runner.run(&crate::ado::az(repo, ["repos", "show", "--repository", &repo.name, "--project", &repo.project, "--query", "name"])) {
+                Ok(o) if o.success() => check(&mut out, Some(true), &label, format!("reachable (used for {name})")),
+                Ok(o) => check(
+                    &mut out,
+                    None,
+                    &label,
+                    format!(
+                        "az cannot reach {} ({}); pull requests of {name} are not followed. Run `az login`, or set AZURE_DEVOPS_EXT_PAT where the ticker starts",
+                        repo.org_url(),
+                        o.error_text().lines().next().unwrap_or("failed")
+                    ),
+                ),
+                Err(error) => check(&mut out, None, &label, format!("az cannot reach {} ({error:#}); pull requests of {name} are not followed", repo.org_url())),
+            }
         }
     }
 
@@ -583,6 +634,58 @@ mod tests {
             }
             assert!(!text.contains("] gh auth:"), "github.com is not in use: {text}");
             assert_eq!(runner.count("gh auth status"), 0);
+        }
+    }
+
+    /// `az` is checked only when a repository is on Azure DevOps, and only
+    /// ever warns.
+    #[test]
+    fn a_repository_on_azure_devops_checks_az_and_its_organization() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Env::for_test(home.path(), &[]);
+        let root = home.path().join("root");
+        let repo = home.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        project::create(&root, "demo", "", vec![project::Repo { path: repo.to_string_lossy().into_owned(), machine: None }]).unwrap();
+        let cfg = home.path().join("cfg");
+
+        // A GitHub-only setup never runs `az`.
+        let runner = runner_with_herdr("herdr 0.9.1\n");
+        report(&env, &root, &cfg, &SessionFlags::default(), &runner, false, None);
+        assert_eq!(runner.count("az "), 0);
+
+        for case in ["reachable", "unreachable", "no-extension", "missing"] {
+            let runner = runner_with_herdr("herdr 0.9.1\n");
+            runner.on_fn(|cmd| cmd.display().ends_with("/app remote get-url origin"), |_| Ok(ok("git@ssh.dev.azure.com:v3/Contoso/Tools/app\n")));
+            match case {
+                "missing" => {}
+                "no-extension" => {
+                    runner.on("az version", ok(r#"{"azure-cli":"2.90.0","extensions":{}}"#));
+                }
+                _ => {
+                    runner.on("az version", ok(r#"{"azure-cli":"2.90.0","extensions":{"azure-devops":"1.0.8"}}"#));
+                }
+            }
+            if case == "reachable" {
+                runner.on("az repos show --repository app --project Tools --query name --org https://dev.azure.com/Contoso --detect false", ok("\"app\"\n"));
+            } else {
+                runner.on("az repos show", fail(1, "ERROR: Before you can run Azure DevOps commands, you need to run the login command"));
+            }
+            let (text, healthy) = report(&env, &root, &cfg, &SessionFlags::default(), &runner, false, None);
+            assert!(healthy, "{case}: {text}");
+            match case {
+                "reachable" => {
+                    assert!(text.contains("[ok  ] az: azure-cli 2.90.0"), "{text}");
+                    assert!(text.contains("[ok  ] az devops: azure-devops extension 1.0.8"), "{text}");
+                    assert!(text.contains("[ok  ] azure devops Contoso: reachable (used for Contoso/Tools/app)"), "{text}");
+                }
+                "unreachable" => assert!(text.contains("[warn] azure devops Contoso: az cannot reach https://dev.azure.com/Contoso (ERROR: Before you can run"), "{text}"),
+                "no-extension" => assert!(text.contains("[warn] az devops: the azure-devops extension is missing"), "{text}"),
+                _ => {
+                    assert!(text.contains("[warn] az: az is not installed; Azure DevOps pull requests are not followed"), "{text}");
+                    assert_eq!(runner.count("az repos show"), 0);
+                }
+            }
         }
     }
 

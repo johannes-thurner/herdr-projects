@@ -246,7 +246,7 @@ pub fn run(ctx: &Ctx) -> Result<()> {
         pid: std::process::id(),
         root: root.display().to_string(),
         started: project::now(),
-        tools: ["herdr", "git", "gh", "ssh", "scp", "rsync"]
+        tools: ["herdr", "git", "gh", "az", "ssh", "scp", "rsync"]
             .iter()
             .map(|tool| {
                 let name = if *tool == "herdr" { ctx.env.herdr_bin() } else { tool.to_string() };
